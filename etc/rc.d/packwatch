@@ -1,0 +1,255 @@
+#!/bin/sh
+
+# PROVIDE: packwatch
+# REQUIRE: FILESYSTEMS ntpd netif
+# KEYWORD: shutdown
+
+# Boot only prepares /var/run/packwatch. A reboot does not resume a
+# recording; the outside system has to send start again.
+#
+#   service packwatch sessionstart <camera-id>
+#   service packwatch sessionstop <camera-id>
+#
+# packwatch_cameras in rc.conf is the fleet that may be started.
+# daemon(8) --restart supervises each session. The pidfile is the
+# supervisor, and a stop signals that pid so the exit is not a crash.
+# Both the supervisor and the recorder run as the packwatch user.
+# daemon -u is the wrong tool: the supervisor would stay root, and a
+# full disk could not stop the restart loop.
+
+. /etc/rc.subr
+
+name=packwatch
+rcvar=packwatch_enable
+start_cmd=packwatch_prepare
+stop_cmd=packwatch_stop
+restart_cmd=packwatch_restart
+status_cmd=packwatch_status
+extra_commands="sessionstart sessionstop"
+sessionstart_cmd=packwatch_sessionstart
+sessionstop_cmd=packwatch_sessionstop
+
+packwatch_user_default=packwatch
+packwatch_bin_default=/usr/local/bin/packwatch
+packwatch_confdir_default=/usr/local/etc/packwatch
+packwatch_rundir_default=/var/run/packwatch
+packwatch_placeholder=PLACEHOLDER-this-directory-is-a-fatzap-do-not-remove
+
+load_rc_config $name
+: ${packwatch_enable:=NO}
+: ${packwatch_cameras:=}
+: ${packwatch_user:=$packwatch_user_default}
+: ${packwatch_bin:=$packwatch_bin_default}
+: ${packwatch_confdir:=$packwatch_confdir_default}
+: ${packwatch_rundir:=$packwatch_rundir_default}
+
+packwatch_prepare()
+{
+	if ! id "$packwatch_user" >/dev/null 2>&1; then
+		echo "packwatch: user $packwatch_user does not exist" >&2
+		return 1
+	fi
+	mkdir -p "$packwatch_rundir"
+	chown "$packwatch_user:$packwatch_user" "$packwatch_rundir"
+	chmod 755 "$packwatch_rundir"
+	# A root test can leave a lock here. The recorder opens it read-write.
+	for _f in "$packwatch_rundir"/*; do
+		[ -e "$_f" ] || continue
+		chown "$packwatch_user:$packwatch_user" "$_f"
+	done
+}
+
+packwatch_restart()
+{
+	echo "packwatch: service restart does not start or stop a session."
+	echo "packwatch: service packwatch sessionstart <camera-id>"
+	echo "packwatch: service packwatch sessionstop <camera-id>"
+}
+
+packwatch_id_ok()
+{
+	_id=$1
+
+	if [ -z "$_id" ] || [ "${#_id}" -gt 64 ]; then
+		return 1
+	fi
+	case $_id in
+	*[!A-Za-z0-9._-]*|.|..)
+		return 1
+		;;
+	esac
+	return 0
+}
+
+packwatch_known()
+{
+	for _known in $packwatch_cameras; do
+		if [ "$_known" = "$1" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+packwatch_supervisor_pid()
+{
+	_pf="$packwatch_rundir/$1.supervisor.pid"
+	_pid=
+
+	if [ ! -f "$_pf" ]; then
+		return 1
+	fi
+	# pidfile(3) may omit the trailing newline. read then returns
+	# non-zero even though it stored the pid.
+	read -r _pid < "$_pf" || true
+	case $_pid in
+	''|*[!0-9]*)
+		return 1
+		;;
+	esac
+	if kill -0 "$_pid" 2>/dev/null; then
+		echo "$_pid"
+		return 0
+	fi
+	return 1
+}
+
+packwatch_sessionstart()
+{
+	_cam=$1
+	_conf="$packwatch_confdir/${_cam}.conf"
+	_pidfile="$packwatch_rundir/${_cam}.supervisor.pid"
+	_root= _mode= _owner= _sup= _dir= _pid=
+
+	if ! packwatch_id_ok "$_cam"; then
+		echo "packwatch: usage: service packwatch sessionstart <camera-id>" >&2
+		return 1
+	fi
+	if ! packwatch_known "$_cam"; then
+		echo "packwatch: $_cam is not in packwatch_cameras" >&2
+		return 1
+	fi
+	packwatch_prepare || return 1
+	if [ ! -f "$_conf" ]; then
+		echo "packwatch: missing $_conf" >&2
+		return 1
+	fi
+	_mode=$(stat -f '%Lp' "$_conf")
+	_owner=$(stat -f '%Su' "$_conf")
+	if [ "$_mode" != "600" ] || [ "$_owner" != "$packwatch_user" ]; then
+		echo "packwatch: $_conf must be mode 0600 and owned by $packwatch_user" >&2
+		return 1
+	fi
+	_sup=$(awk -F= '$1 == "supervisor_pidfile" { print $2 }' "$_conf")
+	if [ "$_sup" != "$_pidfile" ]; then
+		echo "packwatch: supervisor_pidfile in $_conf must be $_pidfile" >&2
+		return 1
+	fi
+	_root=$(awk -F= '$1 == "video_root" { print $2 }' "$_conf")
+	_root=${_root%/}
+	if [ -z "$_root" ] || [ "${_root#/}" = "$_root" ]; then
+		echo "packwatch: video_root in $_conf must be an absolute path" >&2
+		return 1
+	fi
+	_dir="${_root}/${_cam}"
+	if [ ! -d "$_dir" ]; then
+		echo "packwatch: camera directory $_dir is not ready" >&2
+		return 1
+	fi
+	if [ ! -e "${_dir}/${packwatch_placeholder}" ]; then
+		echo "packwatch: ${_dir}/${packwatch_placeholder} is missing" >&2
+		return 1
+	fi
+	if ! su -m "$packwatch_user" -c "test -w '${_dir}' && test -r '${_conf}'"; then
+		echo "packwatch: $packwatch_user cannot read $_conf or write $_dir" >&2
+		return 1
+	fi
+	if _pid=$(packwatch_supervisor_pid "$_cam"); then
+		echo "packwatch: $_cam is already recording (supervisor $_pid)"
+		return 0
+	fi
+	logger -t packwatch -p daemon.notice "session start ${_cam}"
+	su -m "$packwatch_user" -c \
+	    "daemon -c -f -r -P '${_pidfile}' -t 'packwatch/${_cam}' -S -T 'packwatch-${_cam}' -- '${packwatch_bin}' '${_conf}'"
+	_rc=$?
+	if [ "$_rc" -eq 3 ]; then
+		echo "packwatch: $_cam is already recording"
+		return 0
+	fi
+	if [ "$_rc" -ne 0 ]; then
+		echo "packwatch: daemon exited $_rc" >&2
+		return "$_rc"
+	fi
+	_i=0
+	while ! _pid=$(packwatch_supervisor_pid "$_cam"); do
+		_i=$((_i + 1))
+		if [ "$_i" -gt 5 ]; then
+			echo "packwatch: supervisor for $_cam did not stay up" >&2
+			return 1
+		fi
+		sleep 1
+	done
+	echo "packwatch: $_cam recording, supervisor $_pid"
+}
+
+packwatch_sessionstop()
+{
+	_cam=$1
+	_pid=
+
+	if ! packwatch_id_ok "$_cam"; then
+		echo "packwatch: usage: service packwatch sessionstop <camera-id>" >&2
+		return 1
+	fi
+	if ! _pid=$(packwatch_supervisor_pid "$_cam"); then
+		echo "packwatch: $_cam is idle"
+		return 0
+	fi
+	logger -t packwatch -p daemon.notice "session stop ${_cam} supervisor ${_pid}"
+	kill -TERM "$_pid" || return 1
+	_i=0
+	while kill -0 "$_pid" 2>/dev/null; do
+		_i=$((_i + 1))
+		if [ "$_i" -gt 20 ]; then
+			echo "packwatch: supervisor $_pid for $_cam did not exit" >&2
+			return 1
+		fi
+		sleep 1
+	done
+	echo "packwatch: $_cam stopped"
+}
+
+packwatch_stop()
+{
+	_pf= _cam= _any=0
+
+	for _pf in "$packwatch_rundir"/*.supervisor.pid; do
+		[ -f "$_pf" ] || continue
+		_any=1
+		_cam=${_pf##*/}
+		_cam=${_cam%.supervisor.pid}
+		packwatch_sessionstop "$_cam" || return 1
+	done
+	if [ "$_any" -eq 0 ]; then
+		echo "packwatch: no sessions"
+	fi
+}
+
+packwatch_status()
+{
+	_cam= _pid=
+
+	if [ -z "$packwatch_cameras" ]; then
+		echo "packwatch: no cameras in packwatch_cameras"
+		return 0
+	fi
+	for _cam in $packwatch_cameras; do
+		if _pid=$(packwatch_supervisor_pid "$_cam"); then
+			echo "$_cam recording supervisor $_pid"
+		else
+			echo "$_cam idle"
+		fi
+	done
+}
+
+run_rc_command "$@"

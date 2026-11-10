@@ -1,0 +1,30 @@
+# Copy to /usr/local/etc/packwatch/<camera-id>.conf, chown packwatch,
+# and chmod 0600.
+# Spaces around a value are removed.
+# The file must be a regular file, not a symlink. Group and other
+# permission bits are refused because the password is in this file.
+# ip is a numeric IPv4 address. A static binary does not use DNS.
+# path is the RTSP stream path with no scheme and no query.
+# Try h264Preview_01_sub first. Preview_01_sub is the other name
+# for the same fluent stream.
+# supervisor_pidfile is the daemon(8) -P file, not the child pidfile.
+# The supervisor must run as the same user as packwatch, so a full
+# disk can signal that supervisor and stop the restart loop.
+# packwatch does not create video_root/<camera-id>. Create that
+# directory first, with an empty
+# PLACEHOLDER-this-directory-is-a-fatzap-do-not-remove.
+# A start event is: service packwatch sessionstart <camera-id>
+# A stop event is:  service packwatch sessionstop <camera-id>
+# Boot does not start a session.
+
+camera_id=cam01
+ip=192.0.2.11
+port=554
+path=h264Preview_01_sub
+user=admin
+password=change-me
+video_root=/tank/video
+read_timeout_sec=10
+open_timeout_sec=15
+failure_delay_sec=10
+supervisor_pidfile=/var/run/packwatch/cam01.supervisor.pid
